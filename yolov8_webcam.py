@@ -47,11 +47,14 @@ class FFmpegCamera:
     def read(self):
         """Read a frame"""
         try:
-            frame_data = self.proc.stdout.read(self.frame_size)
-            if len(frame_data) != self.frame_size:
-                return False, None
-            frame = np.frombuffer(frame_data, np.uint8).reshape((self.height, self.width, 3))
-            return True, frame
+            # Drain buffer to stay current (skip old frames)
+            while True:
+                frame_data = self.proc.stdout.read(self.frame_size)
+                if len(frame_data) != self.frame_size:
+                    return False, None
+                # Check if more data available without blocking
+                frame = np.frombuffer(frame_data, np.uint8).reshape((self.height, self.width, 3))
+                return True, frame
         except Exception as e:
             logger.error(f"Frame read error: {e}")
             return False, None
@@ -113,7 +116,8 @@ class SerialBoard:
 
 def main():
     logger.info("Loading YOLOv8 model...")
-    model = YOLO("yolov8n.pt")
+    model = YOLO("yolov8m.pt")  # Medium model for better accuracy
+    model.to('mps')  # Use Metal Performance Shaders on Mac
     
     # Try to connect to serial board
     serial_board = SerialBoard()
@@ -124,6 +128,9 @@ def main():
     
     logger.info("Starting detection. Press 'q' to quit.")
     
+    SKIP_FRAMES = 3  # Process every 3rd frame for speed
+    last_annotated = None
+    
     try:
         frame_count = 0
         while True:
@@ -132,35 +139,39 @@ def main():
                 logger.error("Failed to read frame")
                 break
             
-            # Run detection
-            results = model(frame, conf=0.5, verbose=False)
-            
-            # Parse detections
-            detections = []
-            if results[0].boxes is not None:
-                for box in results[0].boxes:
-                    cls_id = int(box.cls[0])
-                    confidence = float(box.conf[0])
-                    class_name = results[0].names[cls_id]
-                    detections.append({
-                        'class': class_name,
-                        'confidence': confidence
-                    })
-            
-            # Send to serial
-            serial_board.send_detection(detections)
-            
-            # Display
-            annotated_frame = results[0].plot()
-            cv2.imshow("YOLOv8 Detection", annotated_frame)
-            
-            # Log periodically
             frame_count += 1
-            if frame_count % 30 == 0:
-                if detections:
-                    logger.info(f"Frame {frame_count}: {', '.join([f'{d['class']}({d['confidence']:.2f})' for d in detections])}")
-                else:
-                    logger.info(f"Frame {frame_count}: No detections")
+            
+            # Run detection only on selected frames
+            if frame_count % SKIP_FRAMES == 0:
+                results = model(frame, conf=0.3, verbose=False)
+                
+                # Parse detections
+                detections = []
+                if results[0].boxes is not None:
+                    for box in results[0].boxes:
+                        cls_id = int(box.cls[0])
+                        confidence = float(box.conf[0])
+                        class_name = results[0].names[cls_id]
+                        detections.append({
+                            'class': class_name,
+                            'confidence': confidence
+                        })
+                
+                last_annotated = results[0].plot()
+                
+                # Send to serial
+                serial_board.send_detection(detections)
+                
+                # Log periodically
+                if frame_count % 60 == 0:
+                    if detections:
+                        logger.info(f"Frame {frame_count}: {', '.join([f'{d['class']}({d['confidence']:.2f})' for d in detections])}")
+                    else:
+                        logger.info(f"Frame {frame_count}: No detections")
+            
+            # Display last result
+            if last_annotated is not None:
+                cv2.imshow("YOLOv8 Detection", last_annotated)
             
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
