@@ -1,58 +1,99 @@
 #!/usr/bin/env python3
 """
-YOLOv8 Real-time Detection with macOS Webcam and Serial Output
+YOLOv8 Detection using ffmpeg subprocess for camera access on macOS
 """
 
+import subprocess
+import numpy as np
 import cv2
 import serial
 import time
 import logging
+import threading
 from ultralytics import YOLO
-import sys
-from pathlib import Path
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+class FFmpegCamera:
+    def __init__(self, device_name="FaceTime HD Camera", width=640, height=480, fps=30):
+        self.width = width
+        self.height = height
+        self.frame_size = width * height * 3
+        
+        cmd = [
+            'ffmpeg',
+            '-f', 'avfoundation',
+            '-framerate', str(fps),
+            '-i', device_name,
+            '-pix_fmt', 'bgr24',
+            '-s', f'{width}x{height}',
+            '-fflags', 'nobuffer',
+            '-flags', 'low_delay',
+            '-f', 'rawvideo',
+            'pipe:'
+        ]
+        
+        self.proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            bufsize=self.frame_size * 2
+        )
+        time.sleep(2)
+        logger.info(f"Camera opened: {device_name}")
+    
+    def read(self):
+        """Read a frame"""
+        try:
+            frame_data = self.proc.stdout.read(self.frame_size)
+            if len(frame_data) != self.frame_size:
+                return False, None
+            frame = np.frombuffer(frame_data, np.uint8).reshape((self.height, self.width, 3))
+            return True, frame
+        except Exception as e:
+            logger.error(f"Frame read error: {e}")
+            return False, None
+    
+    def release(self):
+        try:
+            self.proc.terminate()
+            self.proc.wait(timeout=2)
+        except:
+            self.proc.kill()
+
+
 class SerialBoard:
     def __init__(self, port=None, baudrate=115200, timeout=1):
-        """Initialize serial connection to external board"""
         self.port = port
         self.baudrate = baudrate
         self.timeout = timeout
         self.ser = None
         
     def connect(self):
-        """Establish serial connection"""
         try:
             if self.port is None:
-                # Auto-detect on macOS
-                self.port = self._detect_port()
+                import glob
+                ports = glob.glob('/dev/tty.*') + glob.glob('/dev/cu.*')
+                if ports:
+                    self.port = ports[0]
+                else:
+                    return False
             
             self.ser = serial.Serial(self.port, self.baudrate, timeout=self.timeout)
-            time.sleep(2)  # Wait for device to initialize
-            logger.info(f"Connected to serial board on {self.port} at {self.baudrate} baud")
+            time.sleep(2)
+            logger.info(f"Connected to serial board on {self.port}")
             return True
         except Exception as e:
-            logger.error(f"Failed to connect to serial board: {e}")
+            logger.warning(f"Serial connection failed: {e}")
             return False
     
-    def _detect_port(self):
-        """Auto-detect serial port on macOS"""
-        import glob
-        ports = glob.glob('/dev/tty.*') + glob.glob('/dev/cu.*')
-        if ports:
-            return ports[0]
-        raise RuntimeError("No serial ports found")
-    
     def send_detection(self, detections):
-        """Send detection results to serial board"""
         if self.ser is None or not self.ser.is_open:
             return
         
         try:
-            # Format: "DETECT:class1,conf1;class2,conf2\n"
             if detections:
                 message = "DETECT:" + ";".join([
                     f"{det['class']},{det['confidence']:.2f}"
@@ -62,97 +103,73 @@ class SerialBoard:
                 message = "DETECT:NONE\n"
             
             self.ser.write(message.encode())
-            logger.debug(f"Sent: {message.strip()}")
-        except Exception as e:
-            logger.error(f"Failed to send data: {e}")
+        except:
+            pass
     
     def close(self):
-        """Close serial connection"""
         if self.ser and self.ser.is_open:
             self.ser.close()
-            logger.info("Serial connection closed")
-
-
-class YOLOv8Detector:
-    def __init__(self, model_name="yolov8n", confidence_threshold=0.5):
-        """Initialize YOLOv8 model"""
-        logger.info(f"Loading YOLOv8 model: {model_name}")
-        self.model = YOLO(f"{model_name}.pt")
-        self.confidence_threshold = confidence_threshold
-    
-    def detect(self, frame):
-        """Run detection on frame"""
-        results = self.model(frame, conf=self.confidence_threshold, verbose=False)
-        return results[0]
-    
-    def parse_results(self, results):
-        """Parse detection results"""
-        detections = []
-        if results.boxes is not None:
-            for box in results.boxes:
-                cls_id = int(box.cls[0])
-                confidence = float(box.conf[0])
-                class_name = results.names[cls_id]
-                
-                detections.append({
-                    'class': class_name,
-                    'confidence': confidence,
-                    'box': box.xyxy[0].cpu().numpy()
-                })
-        return detections
 
 
 def main():
-    """Main execution"""
-    # Initialize components
-    detector = YOLOv8Detector(model_name="yolov8n", confidence_threshold=0.5)
+    logger.info("Loading YOLOv8 model...")
+    model = YOLO("yolov8n.pt")
+    
+    # Try to connect to serial board
     serial_board = SerialBoard()
+    serial_board.connect()
     
-    # Connect to serial board
-    if not serial_board.connect():
-        logger.warning("Continuing without serial output")
-    
-    # Open webcam
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        logger.error("Failed to open webcam")
-        return
+    # Open camera via ffmpeg
+    cap = FFmpegCamera()
     
     logger.info("Starting detection. Press 'q' to quit.")
     
     try:
+        frame_count = 0
         while True:
             ret, frame = cap.read()
             if not ret:
-                logger.error("Failed to read frame from webcam")
+                logger.error("Failed to read frame")
                 break
             
             # Run detection
-            results = detector.detect(frame)
-            detections = detector.parse_results(results)
+            results = model(frame, conf=0.5, verbose=False)
             
-            # Send to serial board
+            # Parse detections
+            detections = []
+            if results[0].boxes is not None:
+                for box in results[0].boxes:
+                    cls_id = int(box.cls[0])
+                    confidence = float(box.conf[0])
+                    class_name = results[0].names[cls_id]
+                    detections.append({
+                        'class': class_name,
+                        'confidence': confidence
+                    })
+            
+            # Send to serial
             serial_board.send_detection(detections)
             
-            # Draw detections on frame
-            annotated_frame = results.plot()
-            
             # Display
+            annotated_frame = results[0].plot()
             cv2.imshow("YOLOv8 Detection", annotated_frame)
             
-            # Log detections
-            if detections:
-                logger.info(f"Detected: {', '.join([f'{d['class']}({d['confidence']:.2f})' for d in detections])}")
+            # Log periodically
+            frame_count += 1
+            if frame_count % 30 == 0:
+                if detections:
+                    logger.info(f"Frame {frame_count}: {', '.join([f'{d['class']}({d['confidence']:.2f})' for d in detections])}")
+                else:
+                    logger.info(f"Frame {frame_count}: No detections")
             
-            # Exit on 'q'
             if cv2.waitKey(1) & 0xFF == ord('q'):
-                logger.info("Exiting...")
                 break
     
     finally:
         cap.release()
         cv2.destroyAllWindows()
         serial_board.close()
+        logger.info("Done")
 
 
 if __name__ == "__main__":
