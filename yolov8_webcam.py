@@ -10,6 +10,7 @@ import serial
 import time
 import logging
 import threading
+import gc
 from ultralytics import YOLO
 
 logging.basicConfig(level=logging.INFO)
@@ -39,7 +40,7 @@ class FFmpegCamera:
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
-            bufsize=self.frame_size * 2
+            bufsize=self.frame_size
         )
         time.sleep(2)
         logger.info(f"Camera opened: {device_name}")
@@ -98,8 +99,9 @@ class SerialBoard:
         
         try:
             if detections:
+                # Format: DETECT:class,conf,x1,y1,x2,y2;class,conf,x1,y1,x2,y2\n
                 message = "DETECT:" + ";".join([
-                    f"{det['class']},{det['confidence']:.2f}"
+                    f"{det['class']},{det['confidence']:.2f},{det['x1']},{det['y1']},{det['x2']},{det['y2']}"
                     for det in detections
                 ]) + "\n"
             else:
@@ -124,11 +126,11 @@ def main():
     serial_board.connect()
     
     # Open camera via ffmpeg
-    cap = FFmpegCamera()
+    cap = FFmpegCamera(width=320, height=320)  # Minimal resolution for speed
     
     logger.info("Starting detection. Press 'q' to quit.")
     
-    SKIP_FRAMES = 3  # Process every 3rd frame for speed
+    SKIP_FRAMES = 4  # Process every 4th frame (minimum latency)
     last_annotated = None
     
     try:
@@ -141,9 +143,9 @@ def main():
             
             frame_count += 1
             
-            # Run detection only on selected frames
+            # Run detection on every frame
             if frame_count % SKIP_FRAMES == 0:
-                results = model(frame, conf=0.3, verbose=False)
+                results = model(frame, conf=0.4, verbose=False)
                 
                 # Parse detections
                 detections = []
@@ -152,9 +154,14 @@ def main():
                         cls_id = int(box.cls[0])
                         confidence = float(box.conf[0])
                         class_name = results[0].names[cls_id]
+                        xyxy = box.xyxy[0].cpu().numpy()
                         detections.append({
                             'class': class_name,
-                            'confidence': confidence
+                            'confidence': confidence,
+                            'x1': int(xyxy[0]),
+                            'y1': int(xyxy[1]),
+                            'x2': int(xyxy[2]),
+                            'y2': int(xyxy[3])
                         })
                 
                 last_annotated = results[0].plot()
@@ -162,12 +169,16 @@ def main():
                 # Send to serial
                 serial_board.send_detection(detections)
                 
-                # Log periodically
-                if frame_count % 60 == 0:
+                # Log periodically (every ~2 seconds at 30fps)
+                if frame_count % 120 == 0:
                     if detections:
-                        logger.info(f"Frame {frame_count}: {', '.join([f'{d['class']}({d['confidence']:.2f})' for d in detections])}")
+                        det_str = ', '.join([f"{d['class']}({d['confidence']:.2f}) [{d['x1']},{d['y1']},{d['x2']},{d['y2']}]" for d in detections])
+                        logger.info(f"Frame {frame_count}: {det_str}")
                     else:
                         logger.info(f"Frame {frame_count}: No detections")
+                    
+                    # Flush memory every 4 seconds
+                    gc.collect()
             
             # Display last result
             if last_annotated is not None:
