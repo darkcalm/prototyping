@@ -109,9 +109,19 @@ class SerialBoard:
         self.timeout = timeout
         self.ser = None
         self.last_command_time = 0
-        self.command_cooldown = 2.5  # Seconds to wait between servo commands
+        self.command_cooldown = 0.5  # Seconds to wait between servo commands
         self.last_detection_time = 0
         self.detection_timeout = 5.0  # Return to center after 5 seconds of no detection
+        self.cup_side = "10"  # Cup waste goes to LEFT (10) - change to "11" for RIGHT
+        self.clamshell_side = "11"  # Clamshell waste goes to RIGHT (11) - change to "10" for LEFT
+        self.blocker_blocks_clamshell = True  # Blocker purpose: True=clamshell, False=cups
+        
+        # State tracking for multi-step logic
+        self.step = 0  # 0=idle, 1=blocking, 2=guiding_first, 3=unblocking, 4=guiding_second
+        
+        # Time-based averaging for stable signal
+        self.detection_history = []  # [(timestamp, cup_left, cup_right, clam_left, clam_right)]
+        self.averaging_window = 0.5  # seconds
         
     def connect(self):
         try:
@@ -135,6 +145,41 @@ class SerialBoard:
     
 
     
+    def get_object_side(self, det):
+        """Determine if object is on left or right side of frame"""
+        # Calculate center x of bounding box
+        center_x = (det['x1'] + det['x2']) / 2
+        # Assume frame width is 320 (from default args)
+        frame_width = 320
+        return 'left' if center_x < frame_width / 2 else 'right'
+    
+    def is_clamshell(self, det):
+        """Detect clamshell by label or aspect ratio (excludes person)"""
+        label = det['class'].lower()
+        
+        # Exclude person
+        if label == 'person':
+            return False
+        
+        width = det['x2'] - det['x1']
+        height = det['y2'] - det['y1']
+        
+        # List of COCO labels that are clamshell-shaped
+        clamshell_labels = ['cell phone', 'remote', 'spoon', 'book', 'laptop', 
+                           'keyboard', 'mouse', 'credit card', 'passport']
+        
+        # Check if label is clamshell-like
+        if any(clamshell_label in label for clamshell_label in clamshell_labels):
+            return True
+        
+        # Also detect by aspect ratio (width > 1.5x height indicates flat/clamshell shape)
+        if height > 0:
+            aspect_ratio = width / height
+            if aspect_ratio > 1.5:
+                return True
+        
+        return False
+    
     def send_detection(self, detections):
         if self.ser is None or not self.ser.is_open:
             return
@@ -143,41 +188,120 @@ class SerialBoard:
         if time.time() - self.last_command_time < self.command_cooldown:
             return
 
-        # Priority: Cup (11) > Cellphone (10)
         command = None
         target_detected = False
+        cup_on_left = False
+        cup_on_right = False
+        clamshell_on_left = False
+        clamshell_on_right = False
         
+        # Waste separation logic:
+        # Cup: correct side is right -> center, incorrect side (left) -> cup_side, both -> cup_side
+        # Clamshell: correct side is left -> center, incorrect side (right) -> clamshell_side, both -> clamshell_side
         for det in detections:
             label = det['class'].lower()
+            side = self.get_object_side(det)
+            
             if label == 'cup':
-                command = "11"
-                target_detected = True
-                logger.info("Cup detected! Sending STAY RIGHT (11)")
-                break
-            elif label == 'cell phone':
-                command = "10"
-                target_detected = True
-                logger.info("Cell phone detected! Sending STAY LEFT (10)")
-                break
+                if side == 'left':
+                    cup_on_left = True
+                else:
+                    cup_on_right = True
+            elif self.is_clamshell(det):
+                if side == 'left':
+                    clamshell_on_left = True
+                else:
+                    clamshell_on_right = True
         
+        # Add to detection history for time-based averaging
+        now = time.time()
+        self.detection_history.append((now, cup_on_left, cup_on_right, clamshell_on_left, clamshell_on_right))
+        
+        # Remove old entries outside averaging window
+        cutoff_time = now - self.averaging_window
+        self.detection_history = [(t, cl, cr, caml, camr) for t, cl, cr, caml, camr in self.detection_history if t > cutoff_time]
+        
+        # Average over history (majority vote)
+        if self.detection_history:
+            cup_on_left = sum(1 for _, cl, _, _, _ in self.detection_history if cl) > len(self.detection_history) / 2
+            cup_on_right = sum(1 for _, _, cr, _, _ in self.detection_history if cr) > len(self.detection_history) / 2
+            clamshell_on_left = sum(1 for _, _, _, caml, _ in self.detection_history if caml) > len(self.detection_history) / 2
+            clamshell_on_right = sum(1 for _, _, _, _, camr in self.detection_history if camr) > len(self.detection_history) / 2
+        
+        # Debug: show detection state
+        det_state = f"CUP(L:{cup_on_left},R:{cup_on_right}) CLAM(L:{clamshell_on_left},R:{clamshell_on_right})"
+        
+        # Complex waste separation logic with state machine
+        target_detected = False
+        command = None
+        separator_command = None
+        
+        # Case 1: Clamshell left, cup right -> separator center
+        if clamshell_on_left and cup_on_right and not cup_on_left and not clamshell_on_right:
+            separator_command = "0"
+            command = "21"
+            target_detected = True
+            logger.info("Clamshell-LEFT, Cup-RIGHT -> SEP-0, BLK-OFF")
+        
+        # Case 2: Clamshell left, clamshell right -> guide clamshell to correct location
+        elif clamshell_on_left and clamshell_on_right and not cup_on_left and not cup_on_right:
+            separator_command = "10"
+            command = "21"
+            target_detected = True
+            logger.info("Clamshell-LEFT, Clamshell-RIGHT -> SEP-10, BLK-OFF")
+        
+        # Case 3: Cup left, cup right -> guide cup to correct location
+        elif cup_on_left and cup_on_right and not clamshell_on_left and not clamshell_on_right:
+            separator_command = "11"
+            command = "21"
+            target_detected = True
+            logger.info("Cup-LEFT, Cup-RIGHT -> SEP-11, BLK-OFF")
+        
+        # Case 4: Cup left, clamshell right -> two-step process
+        elif cup_on_left and clamshell_on_right and not cup_on_right and not clamshell_on_left:
+            if self.step == 0:
+                command = "20"
+                separator_command = "11"
+                self.step = 1
+                target_detected = True
+                logger.info("Cup-LEFT, Clamshell-RIGHT (Step 1) -> BLK-ON, SEP-11")
+            elif self.step == 1:
+                command = "21"
+                separator_command = "10"
+                self.step = 0
+                target_detected = True
+                logger.info("Cup-LEFT, Clamshell-RIGHT (Step 2) -> BLK-OFF, SEP-10")
+        
+        # Default: No relevant detections
+        else:
+            command = "21"
+            separator_command = "0"
+            target_detected = True
+            logger.info(f"Default: SEP-0, BLK-OFF [{det_state}]")
+        
+        # Send commands
         if target_detected:
             self.last_detection_time = time.time()
-            if command:
-                try:
+            try:
+                if command:
                     self.ser.write(f"{command}\n".encode())
                     self.last_command_time = time.time()
-                except Exception as e:
-                    logger.error(f"Failed to send serial command: {e}")
+                if separator_command:
+                    self.ser.write(f"{separator_command}\n".encode())
+                    self.last_command_time = time.time()
+            except Exception as e:
+                logger.error(f"Failed to send serial command: {e}")
         else:
-            # No cup/cell phone detected - check timeout
             if time.time() - self.last_detection_time > self.detection_timeout:
                 if time.time() - self.last_command_time >= self.command_cooldown:
                     try:
+                        self.ser.write("21\n".encode())
                         self.ser.write("0\n".encode())
                         self.last_command_time = time.time()
-                        logger.info("No cup/cell phone timeout - returning to CENTER (0)")
+                        self.step = 0
+                        logger.info("Timeout: SEP-0, BLK-OFF")
                     except Exception as e:
-                        logger.error(f"Failed to send return-to-center command: {e}")
+                        logger.error(f"Serial error: {e}")
     
     def close(self):
         if self.ser and self.ser.is_open:
