@@ -7,14 +7,37 @@ import subprocess
 import numpy as np
 import cv2
 import serial
+import serial.tools.list_ports
 import time
 import logging
 import threading
 import gc
+import argparse
+import sys
+import torch
 from ultralytics import YOLO
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+class CV2Camera:
+    """Standard OpenCV Camera for Windows/Linux compatibility"""
+    def __init__(self, device_index=0, width=640, height=480):
+        self.cap = cv2.VideoCapture(device_index)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        
+        if not self.cap.isOpened():
+            logger.error(f"Failed to open camera {device_index}")
+        else:
+            logger.info(f"Camera opened: {device_index}")
+            
+    def read(self):
+        return self.cap.read()
+        
+    def release(self):
+        self.cap.release()
 
 
 class FFmpegCamera:
@@ -23,11 +46,22 @@ class FFmpegCamera:
         self.height = height
         self.frame_size = width * height * 3
         
+        if sys.platform == 'darwin':
+            format_flag = 'avfoundation'
+            input_device = device_name
+        elif sys.platform == 'linux':
+            format_flag = 'v4l2'
+            input_device = '/dev/video0'
+        else:
+            # Fallback for Windows if used, though CV2Camera is preferred
+            format_flag = 'dshow' 
+            input_device = f'video={device_name}'
+
         cmd = [
             'ffmpeg',
-            '-f', 'avfoundation',
+            '-f', format_flag,
             '-framerate', str(fps),
-            '-i', device_name,
+            '-i', input_device,
             '-pix_fmt', 'bgr24',
             '-s', f'{width}x{height}',
             '-fflags', 'nobuffer',
@@ -69,20 +103,26 @@ class FFmpegCamera:
 
 
 class SerialBoard:
-    def __init__(self, port=None, baudrate=115200, timeout=1):
+    def __init__(self, port=None, baudrate=9600, timeout=1):
         self.port = port
         self.baudrate = baudrate
         self.timeout = timeout
         self.ser = None
+        self.last_command_time = 0
+        self.command_cooldown = 2.5  # Seconds to wait between servo commands
+        self.last_detection_time = 0
+        self.detection_timeout = 5.0  # Return to center after 5 seconds of no detection
         
     def connect(self):
         try:
             if self.port is None:
-                import glob
-                ports = glob.glob('/dev/tty.*') + glob.glob('/dev/cu.*')
+                ports = [p.device for p in serial.tools.list_ports.comports()]
                 if ports:
-                    self.port = ports[0]
+                    # Prefer the last one as it's often the newly plugged device
+                    self.port = ports[-1]
+                    logger.info(f"Found ports: {ports}, selecting {self.port}")
                 else:
+                    logger.warning("No serial ports found")
                     return False
             
             self.ser = serial.Serial(self.port, self.baudrate, timeout=self.timeout)
@@ -93,23 +133,51 @@ class SerialBoard:
             logger.warning(f"Serial connection failed: {e}")
             return False
     
+
+    
     def send_detection(self, detections):
         if self.ser is None or not self.ser.is_open:
             return
-        
-        try:
-            if detections:
-                # Format: DETECT:class,conf,x1,y1,x2,y2;class,conf,x1,y1,x2,y2\n
-                message = "DETECT:" + ";".join([
-                    f"{det['class']},{det['confidence']:.2f},{det['x1']},{det['y1']},{det['x2']},{det['y2']}"
-                    for det in detections
-                ]) + "\n"
-            else:
-                message = "DETECT:NONE\n"
             
-            self.ser.write(message.encode())
-        except:
-            pass
+        # Check cooldown
+        if time.time() - self.last_command_time < self.command_cooldown:
+            return
+
+        # Priority: Cup (11) > Cellphone (10)
+        command = None
+        target_detected = False
+        
+        for det in detections:
+            label = det['class'].lower()
+            if label == 'cup':
+                command = "11"
+                target_detected = True
+                logger.info("Cup detected! Sending STAY RIGHT (11)")
+                break
+            elif label == 'cell phone':
+                command = "10"
+                target_detected = True
+                logger.info("Cell phone detected! Sending STAY LEFT (10)")
+                break
+        
+        if target_detected:
+            self.last_detection_time = time.time()
+            if command:
+                try:
+                    self.ser.write(f"{command}\n".encode())
+                    self.last_command_time = time.time()
+                except Exception as e:
+                    logger.error(f"Failed to send serial command: {e}")
+        else:
+            # No cup/cell phone detected - check timeout
+            if time.time() - self.last_detection_time > self.detection_timeout:
+                if time.time() - self.last_command_time >= self.command_cooldown:
+                    try:
+                        self.ser.write("0\n".encode())
+                        self.last_command_time = time.time()
+                        logger.info("No cup/cell phone timeout - returning to CENTER (0)")
+                    except Exception as e:
+                        logger.error(f"Failed to send return-to-center command: {e}")
     
     def close(self):
         if self.ser and self.ser.is_open:
@@ -117,16 +185,52 @@ class SerialBoard:
 
 
 def main():
+    parser = argparse.ArgumentParser(description='YOLOv8 Webcam Detection')
+    parser.add_argument('--camera', type=str, default="0", help='Camera device index (0, 1) or RTSP URL')
+    parser.add_argument('--width', type=int, default=320, help='Camera width (default: 320)')
+    parser.add_argument('--height', type=int, default=320, help='Camera height (default: 320)')
+    args = parser.parse_args()
+
+    # Parse camera argument: if it's a digit, convert to int, otherwise keep as string (URL)
+    if args.camera.isdigit():
+        camera_source = int(args.camera)
+    else:
+        camera_source = args.camera
+
     logger.info("Loading YOLOv8 model...")
     model = YOLO("yolov8m.pt")  # Medium model for better accuracy
-    model.to('mps')  # Use Metal Performance Shaders on Mac
+    
+    # Device selection
+    if torch.cuda.is_available():
+        device = 'cuda'
+    elif torch.backends.mps.is_available():
+        device = 'mps'
+    else:
+        device = 'cpu'
+    
+    logger.info(f"Using device: {device}")
+    model.to(device)
     
     # Try to connect to serial board
     serial_board = SerialBoard()
     serial_board.connect()
     
-    # Open camera via ffmpeg
-    cap = FFmpegCamera(width=320, height=320)  # Minimal resolution for speed
+    # Open camera
+    # Use CV2Camera for Windows/Standard compatibility, FFmpegCamera for specific macOS low-latency needs if desired
+    if sys.platform == 'win32':
+        cap = CV2Camera(device_index=camera_source, width=args.width, height=args.height)
+    else:
+        # Default to FFmpegCamera for macOS/Linux as per original script
+        try:
+            if isinstance(camera_source, str):
+                 # If it's a URL (RTSP), FFmpegCamera might need adjustments or just use CV2 for simplicity
+                 # For now, let's force CV2 for network streams to be safe/compatible
+                 cap = CV2Camera(device_index=camera_source, width=args.width, height=args.height)
+            else:
+                 cap = FFmpegCamera(width=args.width, height=args.height)
+        except Exception as e:
+            logger.warning(f"FFmpegCamera failed: {e}. Falling back to CV2Camera.")
+            cap = CV2Camera(device_index=camera_source, width=args.width, height=args.height)
     
     logger.info("Starting detection. Press 'q' to quit.")
     
