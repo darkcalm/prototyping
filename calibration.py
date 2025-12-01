@@ -18,18 +18,22 @@ class ServoCalibrator:
         self.timeout = timeout
         self.ser = None
         
-        # Default servo angles (adjust based on your servo range)
-        self.angles = {
-            'separator': 90,      # Center position
-            'blocker': 90,        # Center position
-            'tray': 90            # Center position
+        # Servo command constants (match servo_separator.ino and yolo_webcam.py FSM)
+        self.commands = {
+            'separator': {'center': 0, 'left': 10, 'right': 11},
+            'blocker': {'on': 20, 'off': 21},
+            'tray': {'up': 30, 'down': 31}
         }
         
-        # Servo command mapping (adjust if needed)
-        self.servo_commands = {
-            'separator': 'SEP',   # Separator servo
-            'blocker': 'BLK',     # Blocker servo
-            'tray': 'TRAY'        # Tray servo
+        # Calibration notes - user will input these in Arduino after testing
+        self.angles = {
+            'separator_center': 90,
+            'separator_left': 45,
+            'separator_right': 135,
+            'blocker_on': 180,
+            'blocker_off': 0,
+            'tray_up': 0,
+            'tray_down': 180
         }
         
     def connect(self):
@@ -52,21 +56,17 @@ class ServoCalibrator:
             print(f"Connection failed: {e}")
             return False
     
-    def send_angle(self, servo_name, angle):
-        """Send servo angle command. Format: servo_name:angle (e.g., 'SEP:90')"""
+    def send_command(self, servo_name, position):
+        """Send FSM command to servo (0,10,11 for sep; 20,21 for blocker; 30,31 for tray)"""
         if self.ser is None or not self.ser.is_open:
             print("ERROR: Serial not connected")
             return False
         
-        # Clamp angle to valid range
-        angle = max(0, min(180, angle))
-        self.angles[servo_name] = angle
-        
         try:
-            command = f"{servo_name}:{angle}\n"
-            self.ser.write(command.encode())
-            print(f"  → {servo_name} = {angle}°")
-            time.sleep(0.1)
+            cmd = str(position)
+            self.ser.write(f"{cmd}\n".encode())
+            print(f"  → {servo_name} = {position} (command sent)")
+            time.sleep(0.2)
             return True
         except Exception as e:
             print(f"ERROR sending command: {e}")
@@ -77,44 +77,71 @@ class ServoCalibrator:
         print(f"\n{'='*60}")
         print(f"CALIBRATING: {servo_name.upper()}")
         print(f"{'='*60}")
-        print(f"Current angle: {self.angles[servo_name]}°")
-        print("\nControls:")
-        print("  [+] or [→] : +5°")
-        print("  [-] or [←] : -5°")
-        print("  [1-9]      : +1° per key")
-        print("  [0]        : -1°")
-        print("  [d]        : default (90°)")
-        print("  [m]        : move to min (0°)")
-        print("  [M]        : move to max (180°)")
-        print("  [s]        : save and continue to next servo")
-        print("  [q]        : quit without saving")
+        
+        if servo_name == 'separator':
+            positions = {'center': 0, 'left': 10, 'right': 11}
+            print("Positions: [c]enter, [l]eft, [r]ight")
+            print("Test commands to verify servo behavior:")
+        elif servo_name == 'blocker':
+            positions = {'on': 20, 'off': 21}
+            print("Positions: [o]n, [f]f")
+            print("Test commands to verify servo behavior:")
+        else:  # tray
+            positions = {'up': 30, 'down': 31}
+            print("Positions: [u]p, [d]own")
+            print("Test commands to verify servo behavior:")
+        
+        print("  [pos key] : move to position (c/l/r or o/f or u/d)")
+        print("  [s]       : confirm and save")
+        print("  [q]       : quit without saving")
         print(f"\nType commands: ", end='', flush=True)
         
         while True:
             cmd = input().strip().lower()
             
-            if cmd in ['+', '→', 'right']:
-                self.send_angle(servo_name, self.angles[servo_name] + 5)
-            elif cmd in ['-', '←', 'left']:
-                self.send_angle(servo_name, self.angles[servo_name] - 5)
-            elif cmd in '123456789':
-                self.send_angle(servo_name, self.angles[servo_name] + int(cmd))
-            elif cmd == '0':
-                self.send_angle(servo_name, self.angles[servo_name] - 1)
-            elif cmd == 'd':
-                self.send_angle(servo_name, 90)
-            elif cmd == 'm':
-                self.send_angle(servo_name, 0)
-            elif cmd == 'M':
-                self.send_angle(servo_name, 180)
-            elif cmd == 's':
-                print(f"Saved {servo_name} = {self.angles[servo_name]}°")
-                return True
-            elif cmd == 'q':
-                print("Quit without saving")
-                return False
-            else:
-                print(f"Unknown command: {cmd}. Try again: ", end='', flush=True)
+            if servo_name == 'separator':
+                if cmd == 'c':
+                    self.send_command(servo_name, positions['center'])
+                elif cmd == 'l':
+                    self.send_command(servo_name, positions['left'])
+                elif cmd == 'r':
+                    self.send_command(servo_name, positions['right'])
+                elif cmd == 's':
+                    print(f"✓ {servo_name} calibration confirmed")
+                    return True
+                elif cmd == 'q':
+                    print("Quit without saving")
+                    return False
+                else:
+                    print(f"Unknown command: {cmd}. Try again: ", end='', flush=True)
+            
+            elif servo_name == 'blocker':
+                if cmd == 'o':
+                    self.send_command(servo_name, positions['on'])
+                elif cmd == 'f':
+                    self.send_command(servo_name, positions['off'])
+                elif cmd == 's':
+                    print(f"✓ {servo_name} calibration confirmed")
+                    return True
+                elif cmd == 'q':
+                    print("Quit without saving")
+                    return False
+                else:
+                    print(f"Unknown command: {cmd}. Try again: ", end='', flush=True)
+            
+            else:  # tray
+                if cmd == 'u':
+                    self.send_command(servo_name, positions['up'])
+                elif cmd == 'd':
+                    self.send_command(servo_name, positions['down'])
+                elif cmd == 's':
+                    print(f"✓ {servo_name} calibration confirmed")
+                    return True
+                elif cmd == 'q':
+                    print("Quit without saving")
+                    return False
+                else:
+                    print(f"Unknown command: {cmd}. Try again: ", end='', flush=True)
     
     def run_calibration(self):
         """Run calibration for all servos"""
@@ -142,30 +169,27 @@ class ServoCalibrator:
         return True
     
     def save_calibration(self, angles):
-        """Save calibrated angles to calibration.yaml"""
-        config = {
-            'servos': {
-                'separator': {'angle': angles['separator']},
-                'blocker': {'angle': angles['blocker']},
-                'tray': {'angle': angles['tray']}
-            }
-        }
+        """Save calibration notes (user updates servo_separator.ino manually)"""
+        config_path = Path('CALIBRATION_RESULT.txt')
         
-        config_path = Path('calibration.yaml')
-        
-        # Write as YAML-like format
         with open(config_path, 'w') as f:
-            f.write("# Servo Calibration Configuration\n")
-            f.write("# Auto-generated by calibration.py\n\n")
-            f.write("servos:\n")
-            for servo, data in config['servos'].items():
-                f.write(f"  {servo}:\n")
-                f.write(f"    angle: {data['angle']}\n")
+            f.write("SERVO CALIBRATION RESULT\n")
+            f.write("="*60 + "\n\n")
+            f.write("All servos tested and confirmed working.\n")
+            f.write("Default angles in servo_separator.ino:\n\n")
+            f.write("  separatorDefault = 90  (center)\n")
+            f.write("  separatorLeft = 45     (command 10)\n")
+            f.write("  separatorRight = 135   (command 11)\n\n")
+            f.write("  blockerOff = 0         (command 21)\n")
+            f.write("  blockerOn = 180        (command 20)\n\n")
+            f.write("  trayUp = 0             (command 30)\n")
+            f.write("  trayDown = 180         (command 31)\n\n")
+            f.write("If servos need different angles, update these values in\n")
+            f.write("servo_separator.ino and re-upload to Arduino.\n")
         
-        print(f"\n✓ Calibration saved to {config_path}")
-        print(f"  separator: {angles['separator']}°")
-        print(f"  blocker: {angles['blocker']}°")
-        print(f"  tray: {angles['tray']}°")
+        print(f"\n✓ Calibration confirmed")
+        print(f"  Servos respond to FSM commands: 0,10,11 (sep), 20,21 (blocker), 30,31 (tray)")
+        print(f"  Settings saved to {config_path}")
     
     def close(self):
         if self.ser and self.ser.is_open:
