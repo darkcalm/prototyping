@@ -191,28 +191,38 @@ class FSMController:
             return self.case_4_steps
         return []
     
-    def _execute_action_step(self, step: ActionStep):
-        """Send commands for a single action step"""
+    def _execute_action_step(self, step: ActionStep, step_idx: int, total_steps: int, elapsed: float, total_time: float):
+        """Send commands for a single action step and log progress"""
+        commands = []
+        
         if step.sep_cmd != -1:
             try:
                 self.serial_board.ser.write(f"{step.sep_cmd}\n".encode())
-                logger.debug(f"Sep command: {step.sep_cmd}")
+                sep_names = {0: "center", 10: "left", 11: "right"}
+                commands.append(f"SEP→{sep_names.get(step.sep_cmd, '?')}")
             except Exception as e:
                 logger.error(f"Failed to send sep command: {e}")
         
         if step.tray_cmd != -1:
             try:
                 self.serial_board.ser.write(f"{step.tray_cmd}\n".encode())
-                logger.debug(f"Tray command: {step.tray_cmd}")
+                tray_names = {30: "up", 31: "down"}
+                commands.append(f"TRAY→{tray_names.get(step.tray_cmd, '?')}")
             except Exception as e:
                 logger.error(f"Failed to send tray command: {e}")
         
         if step.blocker != -1:
             try:
                 self.serial_board.ser.write(f"{step.blocker}\n".encode())
-                logger.debug(f"Blocker command: {step.blocker}")
+                blocker_names = {20: "on", 21: "off"}
+                commands.append(f"BLK→{blocker_names.get(step.blocker, '?')}")
             except Exception as e:
                 logger.error(f"Failed to send blocker command: {e}")
+        
+        # Progress logging
+        progress_pct = int((elapsed / total_time) * 100)
+        cmd_str = ", ".join(commands) if commands else "hold"
+        logger.info(f"  [{step_idx}/{total_steps}] {elapsed:.1f}s: {cmd_str} [{progress_pct}%]")
     
     def update(self, detections: List[dict], dt: float):
         """Update FSM state and execute actions"""
@@ -292,17 +302,18 @@ class FSMController:
             self.state = State.VERIFY
             return
         
+        total_time = steps[-1].t_end
+        
         # Find current step(s) and execute
         found_active_step = False
-        for step in steps:
+        for step_idx, step in enumerate(steps):
             if step.t_start <= elapsed < step.t_end:
-                self._execute_action_step(step)
+                self._execute_action_step(step, step_idx + 1, len(steps), elapsed, total_time)
                 found_active_step = True
-                logger.debug(f"ACTION Case {self.active_case.value}: t={elapsed:.1f}s, step [{step.t_start:.1f}-{step.t_end:.1f}s]")
         
         # Check if action is complete
-        if elapsed >= steps[-1].t_end:
-            logger.info(f"ACTION Case {self.active_case.value} complete (elapsed: {elapsed:.1f}s)")
+        if elapsed >= total_time:
+            logger.info(f"✓ ACTION Case {self.active_case.value} complete ({elapsed:.1f}s)")
             self.state = State.VERIFY
     
     def _state_verify(self):
