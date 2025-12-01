@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-YOLOv8 Detection using ffmpeg subprocess for camera access on macOS
+YOLO Detection using ffmpeg subprocess for camera access on macOS
 """
 
 import subprocess
@@ -309,7 +309,7 @@ class SerialBoard:
 
 
 def main():
-    parser = argparse.ArgumentParser(description='YOLOv8 Webcam Detection')
+    parser = argparse.ArgumentParser(description='YOLO Webcam Detection')
     parser.add_argument('--camera', type=str, default="0", help='Camera device index (0, 1) or RTSP URL')
     parser.add_argument('--width', type=int, default=320, help='Camera width (default: 320)')
     parser.add_argument('--height', type=int, default=320, help='Camera height (default: 320)')
@@ -321,8 +321,8 @@ def main():
     else:
         camera_source = args.camera
 
-    logger.info("Loading YOLOv8 model...")
-    model = YOLO("yolov8m.pt")  # Medium model for better accuracy
+    logger.info("Loading YOLO model...")
+    model = YOLO("yolov11m.pt")  # Medium model for better accuracy
     
     # Device selection
     if torch.cuda.is_available():
@@ -410,7 +410,7 @@ def main():
             
             # Display last result
             if last_annotated is not None:
-                cv2.imshow("YOLOv8 Detection", last_annotated)
+                cv2.imshow("YOLO Detection", last_annotated)
             
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
