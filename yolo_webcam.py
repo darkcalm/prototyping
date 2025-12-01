@@ -48,8 +48,8 @@ class ActionStep:
     t_start: float  # seconds from action start
     t_end: float    # seconds from action start
     sep_cmd: int    # 0=center, 10=left, 11=right, -1=ignore
-    tray_cmd: int   # 0=up, 1=down, -1=ignore
-    blocker: int    # 20=off, 21=on, -1=ignore
+    tray_cmd: int   # 30=up, 31=down, -1=ignore
+    blocker: int    # 20=on, 21=off, -1=ignore
 
 
 class FSMController:
@@ -92,9 +92,9 @@ class FSMController:
         # t=6-7.5s: tray up
         self.case_1_steps = [
             ActionStep(0.0, 1.5, 0, -1, -1),      # sep center
-            ActionStep(1.5, 3.0, -1, 1, -1),      # tray down
+            ActionStep(1.5, 3.0, -1, 31, -1),     # tray down
             ActionStep(3.0, 6.0, -1, -1, -1),     # tray stays down (hold)
-            ActionStep(6.0, 7.5, -1, 0, -1),      # tray up
+            ActionStep(6.0, 7.5, -1, 30, -1),     # tray up
         ]
         
         # Case 2: Clamshell-RIGHT (no cup)
@@ -105,9 +105,9 @@ class FSMController:
         # t=9-10.5s: separator center
         self.case_2_steps = [
             ActionStep(0.0, 3.0, 11, -1, -1),     # sep to right
-            ActionStep(3.0, 4.5, -1, 1, -1),      # tray down
+            ActionStep(3.0, 4.5, -1, 31, -1),     # tray down
             ActionStep(4.5, 7.5, -1, -1, -1),     # tray stays down (hold)
-            ActionStep(7.5, 9.0, -1, 0, -1),      # tray up
+            ActionStep(7.5, 9.0, -1, 30, -1),     # tray up
             ActionStep(9.0, 10.5, 0, -1, -1),     # sep center
         ]
         
@@ -119,9 +119,9 @@ class FSMController:
         # t=9-10.5s: separator center
         self.case_3_steps = [
             ActionStep(0.0, 3.0, 10, -1, -1),     # sep to left
-            ActionStep(3.0, 4.5, -1, 1, -1),      # tray down
+            ActionStep(3.0, 4.5, -1, 31, -1),     # tray down
             ActionStep(4.5, 7.5, -1, -1, -1),     # tray stays down (hold)
-            ActionStep(7.5, 9.0, -1, 0, -1),      # tray up
+            ActionStep(7.5, 9.0, -1, 30, -1),     # tray up
             ActionStep(9.0, 10.5, 0, -1, -1),     # sep center
         ]
         
@@ -140,14 +140,14 @@ class FSMController:
         self.case_4_steps = [
             ActionStep(0.0, 3.0, -1, -1, 20),     # blocker on
             ActionStep(3.0, 6.0, 11, -1, -1),     # sep opposite blockside (right)
-            ActionStep(6.0, 7.5, -1, 1, -1),      # tray down
+            ActionStep(6.0, 7.5, -1, 31, -1),     # tray down
             ActionStep(7.5, 10.5, -1, -1, -1),    # tray stays down (hold)
-            ActionStep(10.5, 12.0, -1, 0, -1),    # tray up
+            ActionStep(10.5, 12.0, -1, 30, -1),   # tray up
             ActionStep(12.0, 15.0, -1, -1, 21),   # blocker off
             ActionStep(15.0, 18.0, 10, -1, -1),   # sep to blockside (left)
-            ActionStep(18.0, 19.5, -1, 1, -1),    # tray down
+            ActionStep(18.0, 19.5, -1, 31, -1),   # tray down
             ActionStep(19.5, 21.0, -1, -1, -1),   # tray stays down (hold)
-            ActionStep(21.0, 22.5, -1, 0, -1),    # tray up
+            ActionStep(21.0, 22.5, -1, 30, -1),   # tray up
             ActionStep(22.5, 24.0, 0, -1, -1),    # sep center
         ]
     
