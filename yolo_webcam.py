@@ -121,7 +121,7 @@ class SerialBoard:
         
         # Time-based averaging for stable signal
         self.detection_history = []  # [(timestamp, cup_left, cup_right, clam_left, clam_right)]
-        self.averaging_window = 0.5  # seconds
+        self.averaging_window = 0.7  # seconds for stable detection on static tray
         
     def connect(self):
         try:
@@ -322,7 +322,7 @@ def main():
         camera_source = args.camera
 
     logger.info("Loading YOLO model...")
-    model = YOLO("yolov11m.pt")  # Medium model for better accuracy
+    model = YOLO("yolo11s.pt")  # Small model for faster inference
     
     # Device selection
     if torch.cuda.is_available():
@@ -358,7 +358,7 @@ def main():
     
     logger.info("Starting detection. Press 'q' to quit.")
     
-    SKIP_FRAMES = 4  # Process every 4th frame (minimum latency)
+    SKIP_FRAMES = 2  # Process every 2nd frame for better responsiveness
     last_annotated = None
     
     try:
@@ -373,7 +373,7 @@ def main():
             
             # Run detection on every frame
             if frame_count % SKIP_FRAMES == 0:
-                results = model(frame, conf=0.4, verbose=False)
+                results = model(frame, conf=0.55, imgsz=256, verbose=False)
                 
                 # Parse detections
                 detections = []
