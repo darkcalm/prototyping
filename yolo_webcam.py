@@ -55,13 +55,14 @@ class ActionStep:
 class FSMController:
     """Finite State Machine for waste separator control"""
     
-    def __init__(self, serial_board):
+    def __init__(self, serial_board, simplified_mode=True):
         self.state = State.BOOT
         self.serial_board = serial_board
+        self.simplified_mode = simplified_mode
         
         # Detection state
         self.detection_timer = 0
-        self.detection_interval = 3.0  # Check every 3 seconds
+        self.detection_interval = 0.3  # Check every 0.3 seconds (~3 seconds for 10 samples)
         
         # Action state
         self.active_case: Optional[CaseID] = None
@@ -73,6 +74,16 @@ class FSMController:
         self.cup_on_right = False
         self.clamshell_on_left = False
         self.clamshell_on_right = False
+        
+        # Majority voting for detection stability
+        self.detection_history = {
+            'cup_on_left': [],
+            'cup_on_right': [],
+            'clamshell_on_left': [],
+            'clamshell_on_right': []
+        }
+        self.history_size = 10  # Track 10 frames
+        self.history_threshold = 5  # Require 5+ out of 10 detections
         
         # Verification state
         self.verification_received = False
@@ -239,6 +250,17 @@ class FSMController:
         elif self.state == State.VERIFY:
             self._state_verify()
     
+    def _vote_on_detection(self, new_state: bool, history_key: str) -> bool:
+        """Update detection history and return majority vote result (5+ out of 10)"""
+        self.detection_history[history_key].append(new_state)
+        if len(self.detection_history[history_key]) > self.history_size:
+            self.detection_history[history_key].pop(0)
+        
+        # Return True if threshold met (5+ out of 10)
+        if len(self.detection_history[history_key]) >= self.history_size:
+            return sum(self.detection_history[history_key]) >= self.history_threshold
+        return False
+    
     def _state_boot(self):
         """Booting state: initialize and move to detection"""
         logger.info("=== STATE: BOOT ===")
@@ -247,45 +269,92 @@ class FSMController:
         self.detection_timer = 0
     
     def _state_detect(self, detections: List[dict], dt: float):
-        """Detection state: run detection every 3 seconds"""
+        """Detection state: run detection every 0.3 seconds with majority voting"""
         self.detection_timer += dt
         
         if self.detection_timer >= self.detection_interval:
             self.detection_timer = 0
             
-            # Parse detections
-            self.cup_on_left = False
-            self.cup_on_right = False
-            self.clamshell_on_left = False
-            self.clamshell_on_right = False
-            
-            for det in detections:
-                label = det['class'].lower()
-                side = self.serial_board.get_object_side(det)
-                
-                if label == 'cup':
-                    if side == 'left':
-                        self.cup_on_left = True
-                    else:
-                        self.cup_on_right = True
-                elif self.serial_board.is_clamshell(det):
-                    if side == 'left':
-                        self.clamshell_on_left = True
-                    else:
-                        self.clamshell_on_right = True
-            
-            # Determine case
-            case = self._determine_case()
-            
-            det_state = f"CUP(L:{self.cup_on_left},R:{self.cup_on_right}) CLAM(L:{self.clamshell_on_left},R:{self.clamshell_on_right})"
-            
-            if case == CaseID.NONE:
-                logger.info(f"DETECT: No action case [{det_state}]")
+            if self.simplified_mode:
+                self._state_detect_simplified(detections)
             else:
-                logger.info(f"DETECT: Case {case.value} detected [{det_state}]")
-                self.active_case = case
-                self.action_start_time = time.time()
-                self.state = State.ACTION
+                self._state_detect_full(detections)
+    
+    def _state_detect_simplified(self, detections: List[dict]):
+        """Simplified mode: detect only cup or clamshell (no left/right)"""
+        # Parse current frame detections
+        has_cup = False
+        has_clamshell = False
+        
+        for det in detections:
+            label = det['class'].lower()
+            if label == 'cup':
+                has_cup = True
+            elif self.serial_board.is_clamshell(det):
+                has_clamshell = True
+        
+        # Apply voting (reuse fields for cup_on_left = has_cup, clamshell_on_left = has_clamshell)
+        cup_detected = self._vote_on_detection(has_cup, 'cup_on_left')
+        clamshell_detected = self._vote_on_detection(has_clamshell, 'clamshell_on_left')
+        
+        # Determine case (simplified)
+        case = CaseID.NONE
+        det_state = f"CUP:{cup_detected}, CLAM:{clamshell_detected}"
+        
+        if cup_detected and not clamshell_detected:
+            case = CaseID.CASE_3  # Cup -> Case 3
+        elif clamshell_detected and not cup_detected:
+            case = CaseID.CASE_2  # Clamshell -> Case 2
+        
+        if case == CaseID.NONE:
+            logger.info(f"DETECT: No action case [{det_state}]")
+        else:
+            logger.info(f"DETECT: Case {case.value} detected [{det_state}]")
+            self.active_case = case
+            self.action_start_time = time.time()
+            self.state = State.ACTION
+    
+    def _state_detect_full(self, detections: List[dict]):
+        """Full mode: detect cup and clamshell with left/right sides"""
+        # Parse current frame detections (single pass)
+        cup_on_left = False
+        cup_on_right = False
+        clamshell_on_left = False
+        clamshell_on_right = False
+        
+        for det in detections:
+            label = det['class'].lower()
+            side = self.serial_board.get_object_side(det)
+            
+            if label == 'cup':
+                if side == 'left':
+                    cup_on_left = True
+                else:
+                    cup_on_right = True
+            elif self.serial_board.is_clamshell(det):
+                if side == 'left':
+                    clamshell_on_left = True
+                else:
+                    clamshell_on_right = True
+        
+        # Apply majority voting
+        self.cup_on_left = self._vote_on_detection(cup_on_left, 'cup_on_left')
+        self.cup_on_right = self._vote_on_detection(cup_on_right, 'cup_on_right')
+        self.clamshell_on_left = self._vote_on_detection(clamshell_on_left, 'clamshell_on_left')
+        self.clamshell_on_right = self._vote_on_detection(clamshell_on_right, 'clamshell_on_right')
+        
+        # Determine case
+        case = self._determine_case()
+        
+        det_state = f"CUP(L:{self.cup_on_left},R:{self.cup_on_right}) CLAM(L:{self.clamshell_on_left},R:{self.clamshell_on_right})"
+        
+        if case == CaseID.NONE:
+            logger.info(f"DETECT: No action case [{det_state}]")
+        else:
+            logger.info(f"DETECT: Case {case.value} detected [{det_state}]")
+            self.active_case = case
+            self.action_start_time = time.time()
+            self.state = State.ACTION
     
     def _state_action(self, dt: float):
         """Action state: execute timed sequence"""
@@ -497,6 +566,7 @@ def main():
     parser.add_argument('--camera', type=str, default="0", help='Camera device index (0, 1) or RTSP URL')
     parser.add_argument('--width', type=int, default=320, help='Camera width (default: 320)')
     parser.add_argument('--height', type=int, default=320, help='Camera height (default: 320)')
+    parser.add_argument('--full', action='store_true', help='Enable full mode (default: simplified mode)')
     args = parser.parse_args()
 
     if args.camera.isdigit():
@@ -522,7 +592,11 @@ def main():
     serial_board.connect()
     
     # Initialize FSM
-    fsm = FSMController(serial_board)
+    fsm = FSMController(serial_board, simplified_mode=not args.full)
+    if args.full:
+        logger.info("Running in FULL mode (cup/clamshell with left/right detection)")
+    else:
+        logger.info("Running in SIMPLIFIED mode (cup or clamshell, no left/right)")
     
     # Start verification input thread
     input_thread = threading.Thread(target=verification_input_thread, args=(fsm,), daemon=True)
@@ -562,7 +636,7 @@ def main():
             
             # Run detection on every frame
             if frame_count % SKIP_FRAMES == 0:
-                results = model(frame, conf=0.55, imgsz=256, verbose=False)
+                results = model(frame, conf=0.3, imgsz=256, verbose=False)
                 
                 # Parse detections
                 detections = []
