@@ -72,21 +72,22 @@ class FSMController:
         # Current detection
         self.cup_on_left = False
         self.cup_on_right = False
-        self.clamshell_on_left = False
-        self.clamshell_on_right = False
+        self.bottle_on_left = False
+        self.bottle_on_right = False
         
         # Majority voting for detection stability
         self.detection_history = {
             'cup_on_left': [],
             'cup_on_right': [],
-            'clamshell_on_left': [],
-            'clamshell_on_right': []
+            'bottle_on_left': [],
+            'bottle_on_right': []
         }
         self.history_size = 10  # Track 10 frames
         self.history_threshold = 5  # Require 5+ out of 10 detections
         
         # Verification state
         self.verification_received = False
+        self.verification_prompted = False
         
         # Initialize case recipes
         self._init_case_recipes()
@@ -164,27 +165,27 @@ class FSMController:
     
     def _determine_case(self) -> CaseID:
         """Determine which case applies based on current detection"""
-        CL, CR = self.clamshell_on_left, self.clamshell_on_right
+        BL, BR = self.bottle_on_left, self.bottle_on_right
         CuL, CuR = self.cup_on_left, self.cup_on_right
         
-        # Case 1: {CUP(L:False,R:True), CLAM(L:True,R:False)} or variations
-        if (not CuL and CuR and CL and not CR) or \
-           (not CuL and not CuR and CL and not CR) or \
-           (not CuL and CuR and not CL and not CR):
+        # Case 1: {CUP(L:False,R:True), BOTTLE(L:True,R:False)} or variations
+        if (not CuL and CuR and BL and not BR) or \
+           (not CuL and not CuR and BL and not BR) or \
+           (not CuL and CuR and not BL and not BR):
             return CaseID.CASE_1
         
-        # Case 2: {CUP(L:False,R:False), CLAM(L:False,R:True)} or {CUP(L:False,R:False), CLAM(L:True,R:True)}
-        elif (not CuL and not CuR and not CL and CR) or \
-             (not CuL and not CuR and CL and CR):
+        # Case 2: {CUP(L:False,R:False), BOTTLE(L:False,R:True)} or {CUP(L:False,R:False), BOTTLE(L:True,R:True)}
+        elif (not CuL and not CuR and not BL and BR) or \
+             (not CuL and not CuR and BL and BR):
             return CaseID.CASE_2
         
-        # Case 3: {CUP(L:True,R:False), CLAM(L:False,R:False)} or {CUP(L:True,R:True), CLAM(L:False,R:False)}
-        elif (CuL and not CuR and not CL and not CR) or \
-             (CuL and CuR and not CL and not CR):
+        # Case 3: {CUP(L:True,R:False), BOTTLE(L:False,R:False)} or {CUP(L:True,R:True), BOTTLE(L:False,R:False)}
+        elif (CuL and not CuR and not BL and not BR) or \
+             (CuL and CuR and not BL and not BR):
             return CaseID.CASE_3
         
-        # Case 4: {CUP(L:True,R:False), CLAM(L:False,R:True)}
-        elif CuL and not CuR and not CL and CR:
+        # Case 4: {CUP(L:True,R:False), BOTTLE(L:False,R:True)}
+        elif CuL and not CuR and not BL and BR:
             return CaseID.CASE_4
         
         else:
@@ -262,8 +263,31 @@ class FSMController:
         return False
     
     def _state_boot(self):
-        """Booting state: initialize and move to detection"""
+        """Booting state: initialize hardware and move to detection"""
         logger.info("=== STATE: BOOT ===")
+        logger.info("Initializing hardware...")
+        
+        # Ensure separator is center
+        try:
+            self.serial_board.ser.write(b"0\n")
+            logger.info("SEP→center")
+        except Exception as e:
+            logger.error(f"Failed to center separator: {e}")
+        
+        # Ensure tray is up
+        try:
+            self.serial_board.ser.write(b"30\n")
+            logger.info("TRAY→up")
+        except Exception as e:
+            logger.error(f"Failed to raise tray: {e}")
+        
+        # Ensure blocker is off
+        try:
+            self.serial_board.ser.write(b"21\n")
+            logger.info("BLK→off")
+        except Exception as e:
+            logger.error(f"Failed to turn off blocker: {e}")
+        
         logger.info("Initialization complete, moving to DETECT state")
         self.state = State.DETECT
         self.detection_timer = 0
@@ -280,31 +304,46 @@ class FSMController:
             else:
                 self._state_detect_full(detections)
     
+    def _is_bounding_box_valid(self, det: dict, min_width: int = 30, min_height: int = 30) -> bool:
+        """Check if bounding box is large enough to be foreground object"""
+        width = det['x2'] - det['x1']
+        height = det['y2'] - det['y1']
+        return width >= min_width and height >= min_height
+    
     def _state_detect_simplified(self, detections: List[dict]):
-        """Simplified mode: detect only cup or clamshell (no left/right)"""
+        """Simplified mode: detect only cup or bottle (no left/right)"""
         # Parse current frame detections
         has_cup = False
-        has_clamshell = False
+        has_bottle = False
         
         for det in detections:
+            width = det['x2'] - det['x1']
+            height = det['y2'] - det['y1']
             label = det['class'].lower()
+            
+            if not self._is_bounding_box_valid(det):
+                logger.debug(f"  {label}: {width}x{height} (too small, filtered)")
+                continue
+            
+            logger.debug(f"  {label}: {width}x{height} (valid)")
+            
             if label == 'cup':
                 has_cup = True
-            elif self.serial_board.is_clamshell(det):
-                has_clamshell = True
+            elif label == 'bottle':
+                has_bottle = True
         
-        # Apply voting (reuse fields for cup_on_left = has_cup, clamshell_on_left = has_clamshell)
+        # Apply voting (reuse fields for cup_on_left = has_cup, bottle_on_left = has_bottle)
         cup_detected = self._vote_on_detection(has_cup, 'cup_on_left')
-        clamshell_detected = self._vote_on_detection(has_clamshell, 'clamshell_on_left')
+        bottle_detected = self._vote_on_detection(has_bottle, 'bottle_on_left')
         
         # Determine case (simplified)
         case = CaseID.NONE
-        det_state = f"CUP:{cup_detected}, CLAM:{clamshell_detected}"
+        det_state = f"CUP:{cup_detected}, BOTTLE:{bottle_detected}"
         
-        if cup_detected and not clamshell_detected:
+        if cup_detected and not bottle_detected:
             case = CaseID.CASE_3  # Cup -> Case 3
-        elif clamshell_detected and not cup_detected:
-            case = CaseID.CASE_2  # Clamshell -> Case 2
+        elif bottle_detected and not cup_detected:
+            case = CaseID.CASE_2  # Bottle -> Case 2
         
         if case == CaseID.NONE:
             logger.info(f"DETECT: No action case [{det_state}]")
@@ -315,15 +354,23 @@ class FSMController:
             self.state = State.ACTION
     
     def _state_detect_full(self, detections: List[dict]):
-        """Full mode: detect cup and clamshell with left/right sides"""
+        """Full mode: detect cup and bottle with left/right sides"""
         # Parse current frame detections (single pass)
         cup_on_left = False
         cup_on_right = False
-        clamshell_on_left = False
-        clamshell_on_right = False
+        bottle_on_left = False
+        bottle_on_right = False
         
         for det in detections:
+            width = det['x2'] - det['x1']
+            height = det['y2'] - det['y1']
             label = det['class'].lower()
+            
+            if not self._is_bounding_box_valid(det):
+                logger.debug(f"  {label}: {width}x{height} (too small, filtered)")
+                continue
+            
+            logger.debug(f"  {label}: {width}x{height} (valid)")
             side = self.serial_board.get_object_side(det)
             
             if label == 'cup':
@@ -331,22 +378,22 @@ class FSMController:
                     cup_on_left = True
                 else:
                     cup_on_right = True
-            elif self.serial_board.is_clamshell(det):
+            elif label == 'bottle':
                 if side == 'left':
-                    clamshell_on_left = True
+                    bottle_on_left = True
                 else:
-                    clamshell_on_right = True
+                    bottle_on_right = True
         
         # Apply majority voting
         self.cup_on_left = self._vote_on_detection(cup_on_left, 'cup_on_left')
         self.cup_on_right = self._vote_on_detection(cup_on_right, 'cup_on_right')
-        self.clamshell_on_left = self._vote_on_detection(clamshell_on_left, 'clamshell_on_left')
-        self.clamshell_on_right = self._vote_on_detection(clamshell_on_right, 'clamshell_on_right')
+        self.bottle_on_left = self._vote_on_detection(bottle_on_left, 'bottle_on_left')
+        self.bottle_on_right = self._vote_on_detection(bottle_on_right, 'bottle_on_right')
         
         # Determine case
         case = self._determine_case()
         
-        det_state = f"CUP(L:{self.cup_on_left},R:{self.cup_on_right}) CLAM(L:{self.clamshell_on_left},R:{self.clamshell_on_right})"
+        det_state = f"CUP(L:{self.cup_on_left},R:{self.cup_on_right}) BOTTLE(L:{self.bottle_on_left},R:{self.bottle_on_right})"
         
         if case == CaseID.NONE:
             logger.info(f"DETECT: No action case [{det_state}]")
@@ -387,26 +434,44 @@ class FSMController:
     
     def _state_verify(self):
         """Verification state: wait for human input"""
-        logger.info("=== STATE: VERIFY ===")
-        logger.info("Waiting for verification. Type 'ok' or 'retry' and press Enter:")
+        if not self.verification_prompted:
+            logger.info("=== STATE: VERIFY ===")
+            logger.info("Waiting for verification. Type 'ok' or 'retry' and press Enter:")
+            self.verification_prompted = True
     
     def handle_verification(self, response: str):
         """Handle verification response from user"""
         response = response.lower().strip()
         if response == 'ok':
             logger.info("Verification accepted. Returning to DETECT.")
-            self.state = State.DETECT
-            self.detection_timer = 0
-            self.active_case = None
-            self.verification_received = False
+            self._reset_detection_state()
         elif response == 'retry':
             logger.info("Retry requested. Returning to DETECT.")
-            self.state = State.DETECT
-            self.detection_timer = 0
-            self.active_case = None
-            self.verification_received = False
+            self._reset_detection_state()
         else:
             logger.warning("Invalid response. Please type 'ok' or 'retry'.")
+    
+    def _reset_detection_state(self):
+        """Reset all detection flags and history when returning to DETECT"""
+        self.state = State.DETECT
+        self.detection_timer = 0
+        self.active_case = None
+        self.verification_received = False
+        self.verification_prompted = False
+        
+        # Clear detection flags
+        self.cup_on_left = False
+        self.cup_on_right = False
+        self.bottle_on_left = False
+        self.bottle_on_right = False
+        
+        # Clear detection history to avoid stale data
+        self.detection_history = {
+            'cup_on_left': [],
+            'cup_on_right': [],
+            'bottle_on_left': [],
+            'bottle_on_right': []
+        }
 
 
 class CV2Camera:
@@ -520,28 +585,7 @@ class SerialBoard:
         frame_width = 320
         return 'left' if center_x < frame_width / 2 else 'right'
     
-    def is_clamshell(self, det):
-        """Detect clamshell by label or aspect ratio (excludes person)"""
-        label = det['class'].lower()
-        
-        if label == 'person':
-            return False
-        
-        width = det['x2'] - det['x1']
-        height = det['y2'] - det['y1']
-        
-        clamshell_labels = ['cell phone', 'remote', 'spoon', 'book', 'laptop',
-                           'keyboard', 'mouse', 'credit card', 'passport']
-        
-        if any(clamshell_label in label for clamshell_label in clamshell_labels):
-            return True
-        
-        if height > 0:
-            aspect_ratio = width / height
-            if aspect_ratio > 1.5:
-                return True
-        
-        return False
+
     
     def close(self):
         if self.ser and self.ser.is_open:
@@ -594,9 +638,9 @@ def main():
     # Initialize FSM
     fsm = FSMController(serial_board, simplified_mode=not args.full)
     if args.full:
-        logger.info("Running in FULL mode (cup/clamshell with left/right detection)")
+        logger.info("Running in FULL mode (cup/bottle with left/right detection)")
     else:
-        logger.info("Running in SIMPLIFIED mode (cup or clamshell, no left/right)")
+        logger.info("Running in SIMPLIFIED mode (cup or bottle, no left/right)")
     
     # Start verification input thread
     input_thread = threading.Thread(target=verification_input_thread, args=(fsm,), daemon=True)
