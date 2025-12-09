@@ -82,8 +82,8 @@ class FSMController:
             'bottle_on_left': [],
             'bottle_on_right': []
         }
-        self.history_size = 10  # Track 10 frames
-        self.history_threshold = 5  # Require 5+ out of 10 detections
+        self.history_size = 3  # Track 3 frames
+        self.history_threshold = 2  # Require 2+ out of 3 detections
         
         # Verification state
         self.verification_received = False
@@ -407,7 +407,7 @@ class FSMController:
         """Action state: execute timed sequence"""
         if self.active_case is None:
             logger.error("ACTION state but no active case!")
-            self.state = State.DETECT
+            self._reset_detection_state()
             return
         
         elapsed = time.time() - self.action_start_time
@@ -415,7 +415,7 @@ class FSMController:
         
         if not steps:
             logger.error(f"No steps defined for case {self.active_case.value}")
-            self.state = State.VERIFY
+            self._reset_detection_state()
             return
         
         total_time = steps[-1].t_end
@@ -430,7 +430,7 @@ class FSMController:
         # Check if action is complete
         if elapsed >= total_time:
             logger.info(f"✓ ACTION Case {self.active_case.value} complete ({elapsed:.1f}s)")
-            self.state = State.VERIFY
+            self._reset_detection_state()
     
     def _state_verify(self):
         """Verification state: wait for human input"""
@@ -704,7 +704,7 @@ def main():
                 # Update FSM
                 fsm.update(detections, dt)
                 
-                if frame_count % 120 == 0:
+                if frame_count % 36 == 0:
                     if detections:
                         det_str = ', '.join([f"{d['class']}({d['confidence']:.2f})" for d in detections])
                         logger.info(f"Frame {frame_count}: {det_str}")
